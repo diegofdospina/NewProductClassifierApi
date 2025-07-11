@@ -1,1 +1,9 @@
-spring.application.name=NewProductClassifierApi
+spring:
+  application:
+    name: NewProductClassifierApi
+  datasource:
+    url: jdbc:postgresql://34.45.12.248:5432/postgres
+    username: postgres
+    password: GFkdA57B}R3>lA_p
+  main:
+    web-application-type: none

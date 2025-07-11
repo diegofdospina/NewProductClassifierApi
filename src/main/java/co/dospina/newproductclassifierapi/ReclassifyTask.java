@@ -1,10 +1,8 @@
 package co.dospina.newproductclassifierapi;
 
-import com.google.api.gax.rpc.UnavailableException;
-import com.google.inject.Guice;
-import com.google.inject.Injector;
 import io.github.resilience4j.ratelimiter.RateLimiter;
 import io.github.resilience4j.ratelimiter.RateLimiterConfig;
+import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -14,51 +12,26 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.apache.poi.ss.usermodel.FormulaEvaluator;
+import org.apache.poi.ss.usermodel.Row;
 import org.apache.poi.ss.usermodel.Sheet;
 import org.apache.poi.ss.usermodel.Workbook;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
-import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.ai.chat.client.advisor.vectorstore.QuestionAnswerAdvisor;
-import org.springframework.ai.chat.model.ChatResponse;
-import org.springframework.ai.vectorstore.SearchRequest;
-import org.springframework.ai.vectorstore.VectorStore;
-import org.springframework.ai.vertexai.gemini.VertexAiGeminiChatModel;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.retry.annotation.Backoff;
-import org.springframework.retry.annotation.Recover;
-import org.springframework.retry.annotation.Retryable;
 import org.springframework.stereotype.Component;
 
 @Component
-public class ReClassify {
+public class ReclassifyTask {
 
-    private final ChatClient chatClient;
-    private final QuestionAnswerAdvisor advisor;
+    private final ReclassifyClient reclassifyClient;
 
     @Autowired
-    public ReClassify(JdbcTemplate jdbcTemplate) {
-
-        Injector injector = Guice.createInjector(new EmbeddingsModule(jdbcTemplate));
-        VectorStore vectorStore = injector.getInstance(VectorStore.class);
-        VertexAiGeminiChatModel chatModel = injector.getInstance(VertexAiGeminiChatModel.class);
-
-        advisor = QuestionAnswerAdvisor.builder(vectorStore)
-            .searchRequest(
-                SearchRequest.builder()
-                    .similarityThreshold(0.4)
-                    .topK(10)
-                    .filterExpression("level == 4")
-                    .build()
-            )
-            .build();
-
-        chatClient = ChatClient.builder(chatModel)
-            .build();
+    public ReclassifyTask(ReclassifyClient reclassifyClient) {
+        this.reclassifyClient = reclassifyClient;
     }
 
     public void run() throws IOException {
-        FileInputStream file = new FileInputStream("/Users/dospina/Downloads/sample_data.xlsx");
+        FileInputStream file = new FileInputStream("/Users/dospina/nmg/Vertex AI + RAG/sample_data.xlsx");
         Workbook workbook = new XSSFWorkbook(file);
 
         Sheet sheet = workbook.getSheetAt(0);
@@ -74,10 +47,11 @@ public class ReClassify {
                     row.getCell(0).getStringCellValue(), // brandCode
                     row.getCell(1).getStringCellValue(), // partNumber
                     row.getCell(2).getStringCellValue(), // currentClassification
-                    row.getCell(3) == null ? null : row.getCell(3).getStringCellValue(),
+                    row.getCell(3).getStringCellValue(), // currentClassificationDescription
+                    row.getCell(4) == null ? null : row.getCell(4).getStringCellValue(),
                     // longDescription
-                    row.getCell(4).getStringCellValue(), // shortDescription
-                    row.getCell(5).getStringCellValue().trim()// manualNewTaxonomy
+                    row.getCell(5).getStringCellValue(), // shortDescription
+                    row.getCell(6).getStringCellValue().trim()// manualNewTaxonomy
                 )
             );
         });
@@ -97,8 +71,8 @@ public class ReClassify {
         products.forEach(product ->
             futures.add(
                 CompletableFuture.runAsync(() -> product.setAutoNewTaxonomy(
-                    RateLimiter.decorateSupplier(rateLimiter, () -> reclassifyProduct(product))
-                        .get()))
+                    RateLimiter.decorateSupplier(rateLimiter,
+                        () -> reclassifyClient.reclassifyProduct(product)).get()))
             )
         );
 
@@ -110,72 +84,34 @@ public class ReClassify {
 
         AtomicInteger rowIndex = new AtomicInteger(0);
         products.forEach(product -> {
-            sheet.getRow(rowIndex.incrementAndGet())
-                .createCell(6)
-                .setCellValue(product.getAutoNewTaxonomy());
-            sheet.getRow(rowIndex.incrementAndGet())
-                .createCell(7)
-                .setCellValue(
-                    product.getManualNewTaxonomy().equals(product.getAutoNewTaxonomy()) ? "Yes"
-                        : "No");
+            Row row = sheet.getRow(rowIndex.incrementAndGet());
+            row.createCell(7).setCellValue(product.getAutoNewTaxonomy());
+            row.createCell(8).setCellValue(
+                product.getManualNewTaxonomy().equals(product.getAutoNewTaxonomy()) ? "Yes" : "No");
         });
 
-        FileOutputStream outputStream = new FileOutputStream(
-            "/Users/dospina/Downloads/sample-data.xlsx");
+        FormulaEvaluator evaluator = workbook.getCreationHelper().createFormulaEvaluator();
+        evaluator.evaluateAll();
+
+        FileOutputStream outputStream = new FileOutputStream(getNextSampleDataFilename("/Users/dospina/nmg/Vertex AI + RAG"));
         workbook.write(outputStream);
         workbook.close();
     }
 
-    @Retryable(
-        retryFor = {UnavailableException.class},
-        backoff = @Backoff(delay = 5000, multiplier = 2)
-    )
-    private String reclassifyProduct(Product product) {
-        ChatResponse response = chatClient.prompt()
-            .advisors(advisor)
-            .user(
-                String.format(
-                    """
-                        Given the short and long description of a product, classify it into one of the possible categories in the format A:B:C:D
-                        Response should always be one of the categories, if the product does not fit any category, return one of the categories that is the closest match.
-                        Don't use any other format and don't add any additional text.
-                        
-                        Short Description:
-                        - %s
-                        Long Description:
-                        - %s
-                        """,
-                    product.getShortDescription(),
-                    product.getLongDescription().orElse("")
-                )
-            )
-            .call()
-            .chatResponse();
-
-        String autoClassification = response.getResult()
-            .getOutput()
-            .getText()
-            .replaceAll("[\\r\\n]", " ")
-            .trim();
-
-        System.out.printf("%-20s %-30s %-30s %-5s%n",
-            product.getBrandCode() + ":" + product.getPartNumber(),
-            product.getManualNewTaxonomy(),
-            autoClassification,
-            product.getManualNewTaxonomy().equals(autoClassification) ? "Yes" : "No"
-        );
-
-        return autoClassification;
-    }
-
-    @Recover
-    private String recover(UnavailableException e, Product product) {
-        // Log the error
-        System.err.printf("Failed to reclassify product %s:%s after retries. Error: %s%n",
-            product.getBrandCode(), product.getPartNumber(), e.getMessage());
-
-        // Return a fallback value
-        return "A:B:C:D";
+    private String getNextSampleDataFilename(String directory) {
+        File dir = new File(directory);
+        File[] files = dir.listFiles((d, name) -> name.matches("sample_data(\\d*)\\.xlsx"));
+        int max = 0;
+        if (files != null) {
+            for (File file : files) {
+                String name = file.getName();
+                String num = name.replaceAll("sample_data(\\d*)\\.xlsx", "$1");
+                int n = num.isEmpty() ? 0 : Integer.parseInt(num);
+                if (n > max) max = n;
+            }
+        }
+        int next = max + 1;
+        return directory + "/sample_data" + (next == 1 ? "" : next) + ".xlsx";
     }
 
 }
